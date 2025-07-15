@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SiameseNetwork(nn.Module):
+class SensorNetwork(nn.Module):
     def __init__(self, input_size, embedding_dim=128):
         super().__init__()
         self.fc = nn.Sequential(

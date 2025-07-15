@@ -1,147 +1,121 @@
 import logging
-import os
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
-
-import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from scipy.spatial.distance import cosine
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
-from torch import nn
+import os 
+from fastapi import Request
+import numpy as np
 
-# ─── Configuration ─────────────────────────────────────────────────────────────
-EMBEDDING_DIR = "KEY_EMBEDDINGS"
-os.makedirs(EMBEDDING_DIR, exist_ok=True)
+from keypress_utils import extract_sensor_feature_windows
+import keypress_model
+from keypress_model import load_model, SensorNetwork
+from keypress_utils import (
+    BBAData,
+    KEYPRESS_REQUIRED_SAMPLES,
+    preprocess_keypress_events,
+    normalize_keypress_features,
+    save_embedding_to_disk_keypress,
+    load_user_embeddings_keypress,
+    prune_old_embeddings_keypress
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-REQUIRED_SAMPLES = 10       # number of samples needed for completion
-MAX_EMBEDDINGS_STORED = 20  # max stored per user after pruning
+app = FastAPI(title="Global Server", version="1.0.0")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ─── Persistence Helpers ───────────────────────────────────────────────────────
-def save_embedding_to_disk(user_id: str, embedding: np.ndarray):
-    files = [f for f in os.listdir(EMBEDDING_DIR) if f.startswith(user_id)]
-    idx = len(files)
-    path = os.path.join(EMBEDDING_DIR, f"{user_id}_{idx}.npy")
-    np.save(path, embedding)
-
-def load_user_embeddings(user_id: str) -> List[np.ndarray]:
-    files = sorted(
-        [f for f in os.listdir(EMBEDDING_DIR) if f.startswith(user_id)],
-        key=lambda f: int(f.split("_")[-1].split('.')[0]),
-    )
-    return [np.load(os.path.join(EMBEDDING_DIR, f)) for f in files]
-
-def prune_old_embeddings(user_id: str, max_embeddings=MAX_EMBEDDINGS_STORED):
-    files = sorted(
-        [f for f in os.listdir(EMBEDDING_DIR) if f.startswith(user_id)],
-        key=lambda f: int(f.split("_")[-1].split('.')[0]),
-    )
-    for f in files[:-max_embeddings]:
-        os.remove(os.path.join(EMBEDDING_DIR, f))
-
-def clear_user_embeddings(user_id: str):
-    for f in os.listdir(EMBEDDING_DIR):
-        if f.startswith(user_id):
-            os.remove(os.path.join(EMBEDDING_DIR, f))
-
-# ─── Model Definition ──────────────────────────────────────────────────────────
-class SiameseGRU(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64):
-        super().__init__()
-        self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 32), nn.ReLU(),
-            nn.Linear(32, 1), nn.Sigmoid()
-        )
-
-    def forward_once(self, x):
-        _, h = self.gru(x)
-        return h.squeeze(0)
-
-    def forward(self, x1, x2):
-        o1, o2 = self.forward_once(x1), self.forward_once(x2)
-        diff = torch.abs(o1 - o2)
-        return self.fc(diff)
-
-# ─── Pydantic Schemas ─────────────────────────────────────────────────────────
-class KeyEvent(BaseModel):
-    id: Optional[str] = None
-    key_code: int
-    key_label: Union[str, int]
-    event_type: str
-    duration_ms: int
-    timestamp: str
-    digram_key1: Optional[str] = None
-    digram_key2: Optional[str] = None
-    context_screen: Optional[str] = None
-    field_name: Optional[str] = None
-
-class Events(BaseModel):
-    keypress_events: List[KeyEvent]
-    swipe_events: List[Dict[str, Any]] = []
-    tap_events: List[Dict[str, Any]] = []
-    sensor_events: List[Dict[str, Any]] = []
-    scroll_events: List[Dict[str, Any]] = []
-
-class BBAData(BaseModel):
-    id: str
-    events: Events
-
-# ─── Utilities ─────────────────────────────────────────────────────────────────
-def preprocess_keypress_events(events: List[KeyEvent]) -> np.ndarray:
-    if len(events) < 2:
-        raise ValueError("Need at least 2 key events")
-    evs = sorted(
-        events,
-        key=lambda x: datetime.fromisoformat(x.timestamp.replace('Z', '+00:00'))
-    )
-    # map key_label to integer codes
-    mapping = {k: i for i, k in enumerate({e.key_label for e in evs})}
-    feats = []
-    for i, e in enumerate(evs):
-        code = mapping[e.key_label]
-        dur = e.duration_ms
-        if i == 0:
-            ikt = 0.0
-        else:
-            prev = datetime.fromisoformat(evs[i - 1].timestamp.replace('Z', '+00:00'))
-            curr = datetime.fromisoformat(e.timestamp.replace('Z', '+00:00'))
-            ikt = (curr - prev).total_seconds() * 1000
-        feats.append([code, dur, ikt])
-    return np.array(feats, dtype=np.float32)
-
-def normalize_features(feats: np.ndarray) -> np.ndarray:
-    out = feats.copy()
-    for col in range(out.shape[1]):
-        mn, mx = out[:, col].min(), out[:, col].max()
-        if mx > mn:
-            out[:, col] = (out[:, col] - mn) / (mx - mn)
-    return out
-
-# ─── Model Loading ────────────────────────────────────────────────────────────
-model: SiameseGRU
-device: torch.device
-
-def load_model():
-    global model, device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SiameseGRU(input_dim=3, hidden_dim=64).to(device)
-    model.load_state_dict(torch.load("siamese_gru_model.pth", map_location=device))
-    model.eval()
-    logger.info(f"Model loaded on {device}")
-
-# ─── FastAPI Setup ────────────────────────────────────────────────────────────
-app = FastAPI(title="BBA Siamese GRU Server", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # update in production to your client’s origins
+    allow_origins=["*"],    
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+SENSOR_MODEL_INPUT_SIZE = 63  # if window=10: 10*6 + 3
+sensor_model = SensorNetwork(input_size=SENSOR_MODEL_INPUT_SIZE)
+sensor_model.load_state_dict(torch.load("sensor_model.pt", map_location=device))
+sensor_model.eval()
+
+KEYPRESS_EMBEDDING_DIR = "KEY_EMBEDDINGS"
+os.makedirs(KEYPRESS_EMBEDDING_DIR, exist_ok=True)
+
+SENSOR_EMBEDDING_DIR = "sensor_embeddings"
+os.makedirs(SENSOR_EMBEDDING_DIR, exist_ok=True)
+
+def embed_sensor(features):
+    with torch.no_grad():
+        x = torch.tensor(features, dtype=torch.float32).to(device)
+        emb = sensor_model.forward_once(x).cpu().numpy()
+        return emb
+
+@app.get("/check_user/{user_id}")
+def check_sensor_user(user_id: str):
+    """
+    Check if the user has already enrolled (i.e., embedding file exists).
+    """
+    path = os.path.join(SENSOR_EMBEDDING_DIR, f"{user_id}.npy")
+    exists = os.path.exists(path)
+    return JSONResponse(content={"exists": exists})
+
+@app.post("/receive")
+async def receive_sensor_data(req: Request):
+    data = await req.json()
+    user_id = data["id"]
+    windows = extract_sensor_feature_windows(data)
+
+    if not windows:
+        return {"status": "error", "msg": "No usable windows"}
+
+    embs = np.stack([embed_sensor(w) for w in windows])
+    np.save(f"{SENSOR_EMBEDDING_DIR}/{user_id}.npy", embs)
+    return {"status": "stored", "user_id": user_id, "windows": len(embs)}
+
+@app.post("/authenticate")
+async def authenticate_sensor_data(req: Request):
+    data = await req.json()
+    user_id = data["id"]
+    user_path = os.path.join(SENSOR_EMBEDDING_DIR, f"{user_id}.npy")
+
+    if not os.path.exists(user_path):
+        return {"auth": False, "msg": "No reference for user"}
+
+    ref = np.load(user_path)  # shape: [n_ref, 128]
+    windows = extract_sensor_feature_windows(data)
+    if not windows:
+        return {"auth": False, "msg": "No usable window"}
+
+    current_embs = np.stack([embed_sensor(w) for w in windows])  # shape: [n_current, 128]
+
+    # Compute distance matrix
+    dists = np.linalg.norm(ref[:, None, :] - current_embs[None, :, :], axis=2)  # shape: [n_ref, n_current]
+    score = float(np.min(dists))  # best match distance
+
+    threshold = 1.0  # tune as needed
+    is_auth = score < threshold
+
+    print(f"[AUTH] User: {user_id} | Score: {score:.4f} | Auth: {is_auth}")
+
+    if is_auth:
+        updated_embs = np.vstack([ref, current_embs])
+        
+        # Trim to max 100 recent embeddings
+        MAX_HISTORY = 100
+        if updated_embs.shape[0] > MAX_HISTORY:
+            updated_embs = updated_embs[-MAX_HISTORY:]
+
+        np.save(user_path, updated_embs)
+
+    return {
+        "status": "ok" if is_auth else "anomaly",
+        "auth": is_auth,
+        "score": score,
+        "threshold": threshold
+    }
+
+ 
+# ------------- - --------------------- ----------------
 
 @app.on_event("startup")
 async def on_startup():
@@ -152,16 +126,15 @@ async def root():
     return {"message": "Server running"}
 
 @app.get("/health")
-async def health_check():
+async def health_check_keypress():
     return {
         "status": "healthy",
-        "model_loaded": model is not None,
+        "model_loaded": keypress_model is not None,
         "device": str(device),
     }
 
-# ─── ENROLL ────────────────────────────────────────────────────────────────────
 @app.post("/enroll/{user_id}")
-async def enroll_user(user_id: str, typing_data: BBAData):
+async def enroll_user_keypress(user_id: str, typing_data: BBAData):
     evs = typing_data.events.keypress_events
     if len(evs) < 2:
         raise HTTPException(
@@ -170,21 +143,21 @@ async def enroll_user(user_id: str, typing_data: BBAData):
         )
     try:
         feats = preprocess_keypress_events(evs)
-        norm = normalize_features(feats)
+        norm = normalize_keypress_features(feats)
 
         with torch.no_grad():
             emb = (
-                model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
+                keypress_model.model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
                 .cpu()
                 .numpy()
                 .flatten()
             )
 
-        save_embedding_to_disk(user_id, emb)
-        prune_old_embeddings(user_id)
+        save_embedding_to_disk_keypress(user_id, emb)
+        prune_old_embeddings_keypress(user_id)
 
-        count = len(load_user_embeddings(user_id))
-        complete = count >= REQUIRED_SAMPLES
+        count = len(load_user_embeddings_keypress(user_id))
+        complete = count >= KEYPRESS_REQUIRED_SAMPLES
 
         return JSONResponse(
             status_code=200,
@@ -192,7 +165,7 @@ async def enroll_user(user_id: str, typing_data: BBAData):
                 "status": "success",
                 "phase": "enroll",
                 "sample_count": count,
-                "required_samples": REQUIRED_SAMPLES,
+                "required_samples": KEYPRESS_REQUIRED_SAMPLES,
                 "enrollment_complete": complete,
             }
         )
@@ -206,31 +179,28 @@ async def enroll_user(user_id: str, typing_data: BBAData):
             detail={"status": "error", "message": str(e)}
         )
 
-# ─── VERIFY ────────────────────────────────────────────────────────────────────
 @app.post("/verify/{user_id}")
-async def verify_user(user_id: str, typing_data: BBAData):
+async def verify_user_keypress(user_id: str, typing_data: BBAData):
     stored = []
     try:
-        stored = load_user_embeddings(user_id)
+        stored = load_user_embeddings_keypress(user_id)
     except Exception:
         pass
 
     if not stored:
-        # no embeddings at all
         raise HTTPException(
             status_code=404,
             detail={"status": "user_not_found", "message": "No embeddings found, please enroll first"}
         )
 
-    if len(stored) < REQUIRED_SAMPLES:
-        # not enough samples yet
+    if len(stored) < KEYPRESS_REQUIRED_SAMPLES:
         raise HTTPException(
             status_code=409,
             detail={
                 "status": "enrollment_incomplete",
-                "message": f"Enrollment incomplete ({len(stored)}/{REQUIRED_SAMPLES})",
+                "message": f"Enrollment incomplete ({len(stored)}/{KEYPRESS_REQUIRED_SAMPLES})",
                 "current_samples": len(stored),
-                "required_samples": REQUIRED_SAMPLES,
+                "required_samples": KEYPRESS_REQUIRED_SAMPLES,
             }
         )
 
@@ -243,11 +213,11 @@ async def verify_user(user_id: str, typing_data: BBAData):
 
     try:
         feats = preprocess_keypress_events(evs)
-        norm = normalize_features(feats)
+        norm = normalize_keypress_features(feats)
 
         with torch.no_grad():
             curr = (
-                model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
+                keypress_model.model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
                 .cpu()
                 .numpy()
                 .flatten()
@@ -257,13 +227,12 @@ async def verify_user(user_id: str, typing_data: BBAData):
         avg_dist = float(np.mean(distances))
         max_dist = float(np.max(distances))
 
-        # smaller distance => more similar
-        distance_threshold = 1.5  # tune this!
+        distance_threshold = 1.5
         verified = avg_dist < distance_threshold
 
         if verified:
-            save_embedding_to_disk(user_id, curr)
-            prune_old_embeddings(user_id)
+            save_embedding_to_disk_keypress(user_id, curr)
+            prune_old_embeddings_keypress(user_id)
 
         return JSONResponse(
             status_code=200,
@@ -285,56 +254,4 @@ async def verify_user(user_id: str, typing_data: BBAData):
         raise HTTPException(
             status_code=500,
             detail={"status": "error", "message": str(e)}
-        )
-
-# ─── USER LISTING & MANAGEMENT ────────────────────────────────────────────────
-@app.get("/users")
-async def list_users():
-    infos: Dict[str, Dict[str, Any]] = {}
-    for f in os.listdir(EMBEDDING_DIR):
-        if not f.endswith(".npy"):
-            continue
-        uid = f.split("_")[0]
-        if uid in infos:
-            continue
-        embs = load_user_embeddings(uid)
-        infos[uid] = {
-            "sample_count": len(embs),
-            "enrollment_complete": len(embs) >= REQUIRED_SAMPLES,
-        }
-    return {"status": "success", "total_users": len(infos), "users": infos}
-
-@app.get("/users/{user_id}")
-async def check_user(user_id: str):
-    try:
-        embs = load_user_embeddings(user_id)
-    except Exception:
-        embs = []
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "sample_count": len(embs),
-        "enrollment_complete": len(embs) >= REQUIRED_SAMPLES,
-    }
-
-@app.delete("/users/{user_id}")
-async def delete_user(user_id: str):
-    try:
-        clear_user_embeddings(user_id)
-        return {"status": "success", "message": f"User {user_id} deleted"}
-    except Exception as e:
-        logger.error(f"[DELETE] {e}")
-        raise HTTPException(
-            status_code=500, detail={"status": "error", "message": str(e)}
-        )
-
-@app.post("/reset/{user_id}")
-async def reset_user(user_id: str):
-    try:
-        clear_user_embeddings(user_id)
-        return {"status": "success", "message": f"User {user_id} enrollment reset"}
-    except Exception as e:
-        logger.error(f"[RESET] {e}")
-        raise HTTPException(
-            status_code=500, detail={"status": "error", "message": str(e)}
         )

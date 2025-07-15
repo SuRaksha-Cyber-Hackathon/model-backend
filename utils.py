@@ -1,7 +1,7 @@
 from datetime import datetime
 import numpy as np
 
-def extract_feature_windows(user_dict, win_size=10, step_size=5):
+def extract_sensor_feature_windows(user_dict, win_size=10, step_size=5):
     sensor = user_dict["events"]["sensor_events"]
     taps = user_dict["events"]["tap_events"]
     swipes = user_dict["events"]["swipe_events"]
