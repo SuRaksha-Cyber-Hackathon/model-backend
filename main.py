@@ -92,7 +92,7 @@ async def authenticate_sensor_data(req: Request):
     dists = np.linalg.norm(ref[:, None, :] - current_embs[None, :, :], axis=2)  # shape: [n_ref, n_current]
     score = float(np.min(dists))  # best match distance
 
-    threshold = 1.0  # tune as needed
+    threshold = 1.0 
     is_auth = score < threshold
 
     print(f"[AUTH] User: {user_id} | Score: {score:.4f} | Auth: {is_auth}")
@@ -100,7 +100,6 @@ async def authenticate_sensor_data(req: Request):
     if is_auth:
         updated_embs = np.vstack([ref, current_embs])
         
-        # Trim to max 100 recent embeddings
         MAX_HISTORY = 100
         if updated_embs.shape[0] > MAX_HISTORY:
             updated_embs = updated_embs[-MAX_HISTORY:]
