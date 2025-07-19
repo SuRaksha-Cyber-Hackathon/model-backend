@@ -7,10 +7,9 @@ import os
 from fastapi import Request
 import numpy as np
 
-from keypress_utils import extract_sensor_feature_windows
-import keypress_model
-from keypress_model import load_model, SensorNetwork
-from keypress_utils import (
+import models
+from models import load_model, SensorNetwork
+from utils import (
     BBAData,
     KEYPRESS_REQUIRED_SAMPLES,
     preprocess_keypress_events,
@@ -32,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+THRESHOLD = 1.0
+MAX_HISTORY = 100
 
 SENSOR_MODEL_INPUT_SIZE = 63  # if window=10: 10*6 + 3
 sensor_model = SensorNetwork(input_size=SENSOR_MODEL_INPUT_SIZE)
@@ -57,20 +59,34 @@ def check_sensor_user(user_id: str):
     """
     path = os.path.join(SENSOR_EMBEDDING_DIR, f"{user_id}.npy")
     exists = os.path.exists(path)
+    logger.info(f"[CHECK] User {user_id} exists: {exists}")
     return JSONResponse(content={"exists": exists})
 
 @app.post("/receive")
-async def receive_sensor_data(req: Request):
+async def receive_data(req: Request):
     data = await req.json()
     user_id = data["id"]
-    windows = extract_sensor_feature_windows(data)
+    windows = data.get("windows", [])
 
     if not windows:
-        return {"status": "error", "msg": "No usable windows"}
+        logger.warning(f"[RECEIVE] No windows for user {user_id}")
+        return {"status": "error", "msg": "No windows provided"}
+    
+    current = np.array(windows, dtype=np.float32)
+    embs = np.stack([embed_sensor(w) for w in current])
 
-    embs = np.stack([embed_sensor(w) for w in windows])
-    np.save(f"{SENSOR_EMBEDDING_DIR}/{user_id}.npy", embs)
-    return {"status": "stored", "user_id": user_id, "windows": len(embs)}
+    os.makedirs(SENSOR_EMBEDDING_DIR, exist_ok=True)
+    np.save(os.path.join(SENSOR_EMBEDDING_DIR, f"{user_id}.npy"), embs)
+
+    logger.info(f"[RECEIVE] Received {len(current)} windows for {user_id}")
+
+
+    return {
+        "status": "stored",
+        "user_id": user_id,
+        "windows": int(embs.shape[0])
+    }
+
 
 @app.post("/authenticate")
 async def authenticate_sensor_data(req: Request):
@@ -81,36 +97,30 @@ async def authenticate_sensor_data(req: Request):
     if not os.path.exists(user_path):
         return {"auth": False, "msg": "No reference for user"}
 
-    ref = np.load(user_path)  # shape: [n_ref, 128]
-    windows = extract_sensor_feature_windows(data)
+    ref = np.load(user_path)  
+    windows = data.get("windows", [])
     if not windows:
-        return {"auth": False, "msg": "No usable window"}
+        return {"auth": False, "msg": "No windows provided"}
 
-    current_embs = np.stack([embed_sensor(w) for w in windows])  # shape: [n_current, 128]
+    current = np.array(windows, dtype=np.float32)
+    current_embs = np.stack([embed_sensor(w) for w in current])  
 
-    # Compute distance matrix
-    dists = np.linalg.norm(ref[:, None, :] - current_embs[None, :, :], axis=2)  # shape: [n_ref, n_current]
-    score = float(np.min(dists))  # best match distance
-
-    threshold = 1.0 
-    is_auth = score < threshold
-
-    print(f"[AUTH] User: {user_id} | Score: {score:.4f} | Auth: {is_auth}")
+    dists = np.linalg.norm(ref[:, None, :] - current_embs[None, :, :], axis=2)
+    score = float(np.min(dists))
+    is_auth = score < THRESHOLD
 
     if is_auth:
-        updated_embs = np.vstack([ref, current_embs])
-        
-        MAX_HISTORY = 100
-        if updated_embs.shape[0] > MAX_HISTORY:
-            updated_embs = updated_embs[-MAX_HISTORY:]
+        updated = np.vstack([ref, current_embs])
+        if updated.shape[0] > MAX_HISTORY:
+            updated = updated[-MAX_HISTORY:]
+        np.save(user_path, updated)
 
-        np.save(user_path, updated_embs)
-
+    logger.info(f"[AUTH] User {user_id} score: {score:.4f} → {'OK' if is_auth else 'ANOMALY'}")
     return {
         "status": "ok" if is_auth else "anomaly",
         "auth": is_auth,
         "score": score,
-        "threshold": threshold
+        "threshold": THRESHOLD
     }
 
  
@@ -128,7 +138,7 @@ async def root():
 async def health_check_keypress():
     return {
         "status": "healthy",
-        "model_loaded": keypress_model is not None,
+        "model_loaded": models is not None,
         "device": str(device),
     }
 
@@ -146,7 +156,7 @@ async def enroll_user_keypress(user_id: str, typing_data: BBAData):
 
         with torch.no_grad():
             emb = (
-                keypress_model.model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
+                models.model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
                 .cpu()
                 .numpy()
                 .flatten()
@@ -157,6 +167,8 @@ async def enroll_user_keypress(user_id: str, typing_data: BBAData):
 
         count = len(load_user_embeddings_keypress(user_id))
         complete = count >= KEYPRESS_REQUIRED_SAMPLES
+
+        logger.info(f"[ENROLL] Stored sample for {user_id} ({count}/{KEYPRESS_REQUIRED_SAMPLES})")
 
         return JSONResponse(
             status_code=200,
@@ -216,7 +228,7 @@ async def verify_user_keypress(user_id: str, typing_data: BBAData):
 
         with torch.no_grad():
             curr = (
-                keypress_model.model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
+                models.model.forward_once(torch.tensor(norm).unsqueeze(0).to(device))
                 .cpu()
                 .numpy()
                 .flatten()
@@ -232,6 +244,8 @@ async def verify_user_keypress(user_id: str, typing_data: BBAData):
         if verified:
             save_embedding_to_disk_keypress(user_id, curr)
             prune_old_embeddings_keypress(user_id)
+
+        logger.info(f"[VERIFY] Distance for {user_id}: avg={avg_dist:.4f}, max={max_dist:.4f}, verified={verified}")
 
         return JSONResponse(
             status_code=200,

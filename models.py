@@ -22,18 +22,6 @@ class KeypressGRU(nn.Module):
         diff = torch.abs(o1 - o2)
         return self.fc(diff)
 
-# Global model instance
-model: KeypressGRU = None
-device: torch.device = None
-
-def load_model():
-    global model, device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = KeypressGRU(input_dim=3, hidden_dim=64).to(device)
-    model.load_state_dict(torch.load("siamese_gru_model.pth", map_location=device))
-    model.eval()
-    logger.info(f"Model loaded on {device}")
-
 class SensorNetwork(nn.Module):
     def __init__(self, input_size, embedding_dim=128):
         super().__init__()
@@ -48,4 +36,17 @@ class SensorNetwork(nn.Module):
 
     def forward(self, x1, x2):
         return self.forward_once(x1), self.forward_once(x2)
+
+model: KeypressGRU = None
+device: torch.device = None
+
+def load_model():
+    global model, device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = KeypressGRU(input_dim=3, hidden_dim=64).to(device)
+    model.load_state_dict(torch.load("siamese_gru_model.pth", map_location=device))
+    model.eval()
+    logger.info(f"Model loaded on {device}")
+
+
 
